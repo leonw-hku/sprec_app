@@ -1,154 +1,224 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
+import time
+
+st.set_page_config(page_title="Site LIMS & SPREC Tracker", layout="wide", page_icon="🧬")
 
 # ==========================================
-# 1. MOCK DATABASE (Your "Rosetta Stone")
+# 1. INITIALIZE SESSION STATE (Database)
 # ==========================================
-# Define standard internal workflows
-WORKFLOWS = {
-    "Workflow A (Standard Serum)": {
-        "instructions": "Allow to clot at Room Temp for 30 mins. Spin at 2000g for 15 mins at RT. Freeze at -80°C.",
-        "sprec_base": ["SER", "SST", "[PRE_TIME]", "C", "A", "A", "C"],
-        "max_pre_delay_hours": 2.0
-    },
-    "Workflow B (Standard EDTA Plasma)": {
-        "instructions": "Keep at Room Temp. Spin at 2000g for 15 mins at RT. Freeze at -80°C.",
-        "sprec_base": ["PL2", "PED", "[PRE_TIME]", "C", "A", "A", "C"],
-        "max_pre_delay_hours": 2.0
-    },
-    "Workflow C (Cold PK EDTA Plasma)": {
-        "instructions": "Place on ICE immediately. Spin at 2000g for 15 mins at 4°C (CHILLED). Freeze at -80°C.",
-        "sprec_base": ["PL2", "PED", "[PRE_TIME]", "E", "A", "A", "C"],
-        "max_pre_delay_hours": 0.5 # Cold PK needs fast processing!
+# Pre-defined SPREC internal workflows
+if 'workflows' not in st.session_state:
+    st.session_state.workflows = {
+        "Workflow A (Standard Serum)": {"sprec": ["SER", "SST", "[PRE]", "C", "A", "A", "[STO]"], "instructions": "30m Room Temp clot. Spin 2000g x 15m. Freeze -80°C."},
+        "Workflow B (Standard EDTA Plasma)": {"sprec": ["PL2", "PED", "[PRE]", "C", "A", "A", "[STO]"], "instructions": "Keep at Room Temp. Spin 2000g x 15m. Freeze -80°C."},
+        "Workflow C (Cold PK Plasma)": {"sprec": ["PL2", "PED", "[PRE]", "E", "A", "A", "[STO]"], "instructions": "Place on ICE. Spin CHILLED 2000g x 15m. Freeze -80°C."}
     }
-}
 
-# Map Sponsor protocols to your internal workflows
-STUDIES = {
-    "Pfizer Protocol 101 - Visit 1 (Biomarker)": "Workflow A (Standard Serum)",
-    "Pfizer Protocol 101 - Visit 1 (PK)": "Workflow C (Cold PK EDTA Plasma)",
-    "Novartis Protocol XYZ - Core Lab": "Workflow B (Standard EDTA Plasma)",
-    "Merck Protocol 404 - Safety Labs": "Workflow A (Standard Serum)"
-}
+# Mapping of Sponsor Studies to Workflows
+if 'studies' not in st.session_state:
+    st.session_state.studies = {
+        "Pfizer PK - Visit 1": "Workflow C (Cold PK Plasma)",
+        "Novartis Core - Visit 2": "Workflow B (Standard EDTA Plasma)"
+    }
+
+# Main Sample Database
+if 'samples' not in st.session_state:
+    st.session_state.samples = pd.DataFrame(columns=[
+        "Sample_ID", "Subject_ID", "Study", "Status", 
+        "Draw_Time", "Spin_Time", "Freeze_Time", 
+        "SPREC_Code", "Location", "Tracking_Number"
+    ])
 
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
-def calculate_pre_delay_code(draw_time, spin_time):
-    """Calculates time difference and assigns SPREC Element 3 code."""
-    # Combine with today's date to allow datetime math
-    today = datetime.today().date()
-    draw_dt = datetime.combine(today, draw_time)
-    spin_dt = datetime.combine(today, spin_time)
+def calculate_pre_delay(draw_t, spin_t):
+    """Calculates time between draw and spin, returns SPREC code."""
+    today = date.today()
+    dt_draw = datetime.combine(today, draw_t)
+    dt_spin = datetime.combine(today, spin_t)
+    if dt_spin < dt_draw: dt_spin = dt_spin.replace(day=today.day + 1)
     
-    # Handle overnight (if spin time is earlier than draw time)
-    if spin_dt < draw_dt:
-        spin_dt = spin_dt.replace(day=today.day + 1)
+    diff_hrs = (dt_spin - dt_draw).total_seconds() / 3600
+    if diff_hrs < 2: return "A"
+    elif 2 <= diff_hrs < 4: return "B"
+    else: return "C"
+
+def get_storage_code(temp):
+    """Returns SPREC storage code."""
+    if temp == "-80°C": return "C"
+    elif temp == "-20°C": return "Q"
+    elif temp == "LN2": return "A"
+    else: return "Z"
+
+# ==========================================
+# 3. UI LAYOUT & TABS
+# ==========================================
+st.title("🧬 Clinical Site LIMS: SPREC & Sample Lifecycle")
+st.markdown("Track samples through: **Setup ➡️ Registration ➡️ Processing ➡️ Storage ➡️ Shipment**")
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "⚙️ 1. Setup", "📝 2. Registration", "🧪 3. Processing", 
+    "❄️ 4. Storage", "📦 5. Shipment", "📊 Master Log"
+])
+
+# --- TAB 1: SETUP ---
+with tab1:
+    st.subheader("Map Sponsor Protocols to Internal Workflows")
+    col1, col2 = st.columns(2)
+    with col1:
+        with st.form("add_study_form"):
+            new_study = st.text_input("New Study / Protocol Name:")
+            assigned_wf = st.selectbox("Assign to Internal Workflow:", options=st.session_state.workflows.keys())
+            if st.form_submit_button("Add Study Mapping"):
+                if new_study:
+                    st.session_state.studies[new_study] = assigned_wf
+                    st.success(f"Added {new_study}!")
+    with col2:
+        st.write("**Current Active Studies (Rosetta Stone):**")
+        st.json(st.session_state.studies)
+
+# --- TAB 2: REGISTRATION (Intake) ---
+with tab2:
+    st.subheader("Log a new sample at the collection chair")
+    with st.form("registration_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            samp_id = st.text_input("Scan/Type Sample Barcode ID:")
+            subj_id = st.text_input("Subject ID:")
+        with col2:
+            study_sel = st.selectbox("Select Study:", options=st.session_state.studies.keys())
+            draw_time = st.time_input("Collection (Draw) Time:")
         
-    diff_hours = (spin_dt - draw_dt).total_seconds() / 3600
+        if st.form_submit_button("Register Sample"):
+            if samp_id and subj_id:
+                if samp_id in st.session_state.samples["Sample_ID"].values:
+                    st.error("Sample ID already exists!")
+                else:
+                    wf = st.session_state.studies[study_sel]
+                    base_sprec = "-".join(st.session_state.workflows[wf]["sprec"])
+                    
+                    new_row = pd.DataFrame([{
+                        "Sample_ID": samp_id, "Subject_ID": subj_id, "Study": study_sel,
+                        "Status": "Registered", "Draw_Time": draw_time, "Spin_Time": None,
+                        "Freeze_Time": None, "SPREC_Code": base_sprec, "Location": "", "Tracking_Number": ""
+                    }])
+                    st.session_state.samples = pd.concat([st.session_state.samples, new_row], ignore_index=True)
+                    st.success(f"Sample {samp_id} Registered! Ready for processing.")
+
+# --- TAB 3: PROCESSING (Bench) ---
+with tab3:
+    st.subheader("Process Samples (Centrifugation)")
+    # Filter for samples that need processing
+    pending_proc = st.session_state.samples[st.session_state.samples["Status"] == "Registered"]
     
-    # SPREC Element 3 Logic (Simplified for Demo)
-    if diff_hours < 2:
-        return "A", diff_hours
-    elif 2 <= diff_hours < 4:
-        return "B", diff_hours
+    if pending_proc.empty:
+        st.info("No samples currently waiting for processing.")
     else:
-        return "C", diff_hours
-
-# Initialize session state to hold our processed samples log
-if 'sample_log' not in st.session_state:
-    st.session_state.sample_log = []
-
-# ==========================================
-# 3. STREAMLIT UI
-# ==========================================
-st.set_page_config(page_title="SPREC Lab Demo", layout="wide")
-
-st.title("🧪 Site Preanalytical Biospecimen Tracker")
-st.markdown("Translate 200 Sponsor manuals into standardized SPREC workflows.")
-st.divider()
-
-col1, col2 = st.columns([1, 1.5])
-
-with col1:
-    st.subheader("1. Study Intake (Rosetta Stone)")
-    # Tech selects the study
-    selected_study = st.selectbox("Select Study & Protocol:", options=list(STUDIES.keys()))
-    
-    # App determines workflow
-    assigned_workflow = STUDIES[selected_study]
-    workflow_data = WORKFLOWS[assigned_workflow]
-    
-    st.info(f"**Assigned Internal Workflow:**\n### {assigned_workflow}")
-    st.write(f"**Bench Instructions:** {workflow_data['instructions']}")
-
-with col2:
-    st.subheader("2. Bench Processing Data")
-    
-    with st.form("processing_form"):
-        sample_id = st.text_input("Sample/Subject ID (e.g., SUBJ-001)")
+        proc_samp = st.selectbox("Select Sample to Process:", options=pending_proc["Sample_ID"])
+        idx = st.session_state.samples.index[st.session_state.samples["Sample_ID"] == proc_samp][0]
         
-        c1, c2, c3 = st.columns(3)
-        with c1: draw_time = st.time_input("Collection (Draw) Time")
-        with c2: spin_time = st.time_input("Centrifuge Start Time")
-        with c3: freeze_time = st.time_input("Freezer Time")
+        # Display instructions for the tech
+        study = st.session_state.samples.at[idx, "Study"]
+        wf = st.session_state.studies[study]
+        st.info(f"**Instructions for {proc_samp}:** {st.session_state.workflows[wf]['instructions']}")
         
-        submitted = st.form_submit_button("Generate SPREC & Log Sample")
+        with st.form("processing_form"):
+            spin_t = st.time_input("Centrifuge Start Time:")
+            if st.form_submit_button("Complete Processing"):
+                draw_t = st.session_state.samples.at[idx, "Draw_Time"]
+                pre_code = calculate_pre_delay(draw_t, spin_t)
+                
+                # Update SPREC and Status
+                current_sprec = st.session_state.samples.at[idx, "SPREC_Code"]
+                updated_sprec = current_sprec.replace("[PRE]", pre_code)
+                
+                st.session_state.samples.at[idx, "Spin_Time"] = spin_t
+                st.session_state.samples.at[idx, "SPREC_Code"] = updated_sprec
+                st.session_state.samples.at[idx, "Status"] = "Processed"
+                st.success("Processing complete! SPREC code updated.")
+                time.sleep(1)
+                st.rerun() # Refresh to move sample out of queue
+
+# --- TAB 4: STORAGE (Freezer) ---
+with tab4:
+    st.subheader("Store Samples in Freezer")
+    pending_store = st.session_state.samples[st.session_state.samples["Status"] == "Processed"]
+    
+    if pending_store.empty:
+        st.info("No samples currently waiting for storage.")
+    else:
+        store_samp = st.selectbox("Select Sample to Store:", options=pending_store["Sample_ID"])
+        idx = st.session_state.samples.index[st.session_state.samples["Sample_ID"] == store_samp][0]
         
-        if submitted and sample_id:
-            # 1. Calculate Delays
-            pre_code, diff_hours = calculate_pre_delay_code(draw_time, spin_time)
+        with st.form("storage_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                freeze_t = st.time_input("Time placed in Freezer:")
+                temp = st.selectbox("Freezer Temperature:", ["-80°C", "-20°C", "LN2"])
+            with col2:
+                box_loc = st.text_input("Freezer/Box Location (e.g., FZ1-BoxA-A1):")
             
-            # 2. Build SPREC Code
-            sprec_list = workflow_data["sprec_base"].copy()
-            sprec_list[2] = pre_code # Insert calculated pre-delay code
-            final_sprec = "-".join(sprec_list)
-            
-            # 3. Check for Deviations
-            is_deviation = diff_hours > workflow_data["max_pre_delay_hours"]
-            status = "Deviation" if is_deviation else "Compliant"
-            
-            # 4. Save to Log
-            st.session_state.sample_log.append({
-                "Sample ID": sample_id,
-                "Study": selected_study,
-                "Workflow": assigned_workflow,
-                "Draw Time": draw_time.strftime("%H:%M"),
-                "Spin Time": spin_time.strftime("%H:%M"),
-                "Pre-Delay (Hrs)": round(diff_hours, 2),
-                "SPREC Code": final_sprec,
-                "Status": status
-            })
-            
-            if is_deviation:
-                st.error(f"⚠️ Protocol Deviation! Pre-centrifugation delay was {round(diff_hours,2)} hours. Max allowed for this workflow is {workflow_data['max_pre_delay_hours']} hours.")
-            else:
-                st.success(f"✅ Sample logged successfully! SPREC Code: **{final_sprec}**")
+            if st.form_submit_button("Store Sample"):
+                if box_loc:
+                    sto_code = get_storage_code(temp)
+                    current_sprec = st.session_state.samples.at[idx, "SPREC_Code"]
+                    final_sprec = current_sprec.replace("[STO]", sto_code)
+                    
+                    st.session_state.samples.at[idx, "Freeze_Time"] = freeze_t
+                    st.session_state.samples.at[idx, "SPREC_Code"] = final_sprec
+                    st.session_state.samples.at[idx, "Location"] = box_loc
+                    st.session_state.samples.at[idx, "Status"] = "Stored"
+                    st.success("Sample Stored!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Please enter a box location.")
 
-# ==========================================
-# 4. AUDIT TRAIL / DATAFRAME
-# ==========================================
-st.divider()
-st.subheader("📋 Daily Sample Audit Trail (Export for Sponsors)")
+# --- TAB 5: SHIPMENT (Dispatch) ---
+with tab5:
+    st.subheader("Ship Samples to Central Lab")
+    pending_ship = st.session_state.samples[st.session_state.samples["Status"] == "Stored"]
+    
+    if pending_ship.empty:
+        st.info("No stored samples available to ship.")
+    else:
+        with st.form("shipment_form"):
+            st.write("Select samples to add to manifest:")
+            selected_to_ship = st.multiselect("Samples:", options=pending_ship["Sample_ID"].tolist())
+            tracking = st.text_input("FedEx/WorldCourier Tracking Number:")
+            
+            if st.form_submit_button("Generate Manifest & Ship"):
+                if selected_to_ship and tracking:
+                    for s_id in selected_to_ship:
+                        idx = st.session_state.samples.index[st.session_state.samples["Sample_ID"] == s_id][0]
+                        st.session_state.samples.at[idx, "Status"] = "Shipped"
+                        st.session_state.samples.at[idx, "Tracking_Number"] = tracking
+                        st.session_state.samples.at[idx, "Location"] = "Shipped"
+                    st.success("Samples marked as shipped!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Select samples and provide a tracking number.")
 
-if st.session_state.sample_log:
-    df = pd.DataFrame(st.session_state.sample_log)
-    
-    # Highlight deviations in red
-    def color_status(val):
-        color = 'red' if val == 'Deviation' else 'green'
-        return f'color: {color}'
-    
-    st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
-    
-    # Download Button
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="Download Daily Log as CSV",
-        data=csv,
-        file_name='daily_sprec_log.csv',
-        mime='text/csv',
-    )
-else:
-    st.write("No samples processed yet today.")
+# --- TAB 6: MASTER LOG ---
+with tab6:
+    st.subheader("📋 Master Sample Audit Trail")
+    if st.session_state.samples.empty:
+        st.write("Database is empty.")
+    else:
+        # Display the dataframe with color-coded statuses
+        def color_status(val):
+            colors = {"Registered": "orange", "Processed": "blue", "Stored": "purple", "Shipped": "green"}
+            return f'color: {colors.get(val, "black")}; font-weight: bold;'
+        
+        st.dataframe(
+            st.session_state.samples.style.map(color_status, subset=['Status']), 
+            use_container_width=True, hide_index=True
+        )
+        
+        # Download CSV
+        csv = st.session_state.samples.to_csv(index=False).encode('utf-8')
+        st.download_button(label="📥 Download Master Manifest (CSV)", data=csv, file_name='master_sample_log.csv', mime='text/csv')
