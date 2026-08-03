@@ -140,7 +140,7 @@ if st.session_state.sample_log:
         color = 'red' if val == 'Deviation' else 'green'
         return f'color: {color}'
     
-    st.dataframe(df.style.applymap(color_status, subset=['Status']), use_container_width=True)
+    st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
     
     # Download Button
     csv = df.to_csv(index=False).encode('utf-8')
